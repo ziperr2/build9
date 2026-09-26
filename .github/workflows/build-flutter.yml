@@ -35,6 +35,9 @@ jobs:
         -Dorg.gradle.jvmargs=-Xmx3g
 
     steps:
+      # =========================================================
+      # 1. PARSE PAYLOAD
+      # =========================================================
       - name: Parse payload
         run: |
           set -euo pipefail
@@ -47,6 +50,9 @@ jobs:
           fi
           echo "ZIP_URL=$ZIP_URL" >> "$GITHUB_ENV"
 
+      # =========================================================
+      # 2. DOWNLOAD + EXTRACT
+      # =========================================================
       - name: Download & extract ZIP
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -54,6 +60,7 @@ jobs:
           set -euo pipefail
           rm -rf project_raw project.zip
           mkdir -p project_raw
+
           if [[ "$ZIP_URL" == *"api.github.com"* ]]; then
             curl -fL --retry 3 --retry-delay 5 \
               -H "Authorization: Bearer ${GH_TOKEN}" \
@@ -62,10 +69,14 @@ jobs:
           else
             curl -fL --retry 3 --retry-delay 5 -o project.zip "$ZIP_URL"
           fi
+
           ls -lh project.zip
           unzip -t project.zip >/dev/null
           unzip -q project.zip -d project_raw
 
+      # =========================================================
+      # 3. AUTO-DETECT: FLUTTER vs GRADLE NATIVE
+      # =========================================================
       - name: Detect project type
         id: detect
         run: |
@@ -77,9 +88,11 @@ jobs:
           SETTINGS=$(find project_raw -maxdepth 6 -type f \
                     \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
                     -not -path "*/build/*" | head -n 1)
+
           echo "pubspec : ${PUBSPEC:-<none>}"
           echo "gradlew : ${GRADLEW:-<none>}"
           echo "settings: ${SETTINGS:-<none>}"
+
           if [ -n "$PUBSPEC" ]; then
             DIR=$(dirname "$PUBSPEC")
             echo "type=flutter" >> "$GITHUB_OUTPUT"
@@ -96,6 +109,9 @@ jobs:
             exit 1
           fi
 
+      # =========================================================
+      # 4. JAVA + FLUTTER SDK (cached)
+      # =========================================================
       - name: Setup Java 17
         uses: actions/setup-java@v4
         with:
@@ -110,6 +126,9 @@ jobs:
           channel: stable
           cache: true
 
+      # =========================================================
+      # 5. CACHES
+      # =========================================================
       - name: Cache pub packages
         if: steps.detect.outputs.type == 'flutter'
         uses: actions/cache@v4
@@ -127,6 +146,9 @@ jobs:
           key: gradle-${{ runner.os }}-${{ hashFiles('project_raw/**/*.gradle*', 'project_raw/**/gradle-wrapper.properties') }}
           restore-keys: gradle-${{ runner.os }}-
 
+      # =========================================================
+      # 6. TUNE gradle.properties
+      # =========================================================
       - name: Tune gradle.properties
         run: |
           set -euo pipefail
@@ -147,6 +169,9 @@ jobs:
             echo "org.gradle.configureondemand=true"
           } >> "$GP"
 
+      # =========================================================
+      # 7a. BUILD FLUTTER (arm64 only)
+      # =========================================================
       - name: Build Flutter APK
         if: steps.detect.outputs.type == 'flutter'
         working-directory: ${{ steps.detect.outputs.dir }}
@@ -161,6 +186,9 @@ jobs:
             --no-tree-shake-icons \
             --no-pub
 
+      # =========================================================
+      # 7b. BUILD GRADLE NATIVE (arm64 only)
+      # =========================================================
       - name: Build Native APK
         if: steps.detect.outputs.type == 'gradle'
         working-directory: ${{ steps.detect.outputs.dir }}
@@ -169,36 +197,56 @@ jobs:
           chmod +x gradlew
           BT="${{ github.event.inputs.build_type }}"
           [ -z "$BT" ] && BT=release
-          if [ "$BT" = "debug" ]; then TASK=":app:assembleDebug"; else TASK=":app:assembleRelease"; fi
+          if [ "$BT" = "debug" ]; then TASK="assembleDebug"; else TASK="assembleRelease"; fi
+          echo "Running: ./gradlew $TASK"
           ./gradlew "$TASK" \
             --parallel --build-cache \
-            -Pandroid.injected.build.abi=arm64-v8a
+            -Pandroid.injected.build.abi=arm64-v8a 2>&1 | tee build.log
+          echo ""
+          echo "=== APK yang dihasilkan (preview) ==="
+          find . -type f -name "*.apk" -not -path "*/intermediates/*" -exec ls -lh {} \; || true
 
+      # =========================================================
+      # 8. LOCATE APK (FIXED — anti gagal)
+      # =========================================================
       - name: Locate APK
         run: |
           set -euo pipefail
           DIR="${{ steps.detect.outputs.dir }}"
-          APK_DIR=""
-          if [ -d "$DIR/build/app/outputs/flutter-apk" ]; then
-            APK_DIR="$DIR/build/app/outputs/flutter-apk"
-          elif [ -d "$DIR/app/build/outputs/apk" ]; then
-            APK_DIR=$(find "$DIR/app/build/outputs/apk" -type d \
-                      \( -name "release" -o -name "debug" \) | head -n 1)
-            [ -z "$APK_DIR" ] && APK_DIR="$DIR/app/build/outputs/apk"
-          fi
-          if [ -z "$APK_DIR" ] || [ -z "$(find "$APK_DIR" -maxdepth 2 -name '*.apk' 2>/dev/null)" ]; then
-            APK=$(find "$DIR" -type f -name "*.apk" \
-                  -not -path "*/intermediates/*" | head -n 1)
-            if [ -z "$APK" ]; then
-              echo "::error::APK tidak ditemukan setelah build."
-              exit 1
-            fi
-            APK_DIR=$(dirname "$APK")
-          fi
-          echo "APK_DIR=$APK_DIR" >> "$GITHUB_ENV"
-          echo "=== APK yang dihasilkan ==="
-          ls -lh "$APK_DIR"/*.apk
+          echo "Scanning APK di: $DIR"
 
+          APK=$(find "$DIR" -type f -name "*.apk" \
+                -not -path "*/intermediates/*" \
+                -not -path "*/tmp/*" \
+                -not -path "*/kotlin/*" \
+                -not -path "*/.gradle/*" \
+                | head -n 1)
+
+          echo "=== Semua APK yang ditemukan ==="
+          find "$DIR" -type f -name "*.apk" \
+            -not -path "*/intermediates/*" \
+            -not -path "*/tmp/*" \
+            -not -path "*/kotlin/*" \
+            -not -path "*/.gradle/*" \
+            -exec ls -lh {} \; || true
+
+          if [ -z "$APK" ]; then
+            echo "::error::APK tidak ditemukan setelah build."
+            echo "=== Struktur build folder (buat diagnosa) ==="
+            find "$DIR" -type d -name "apk" 2>/dev/null || true
+            find "$DIR" -type d -name "outputs" 2>/dev/null || true
+            find "$DIR" -type d -name "build" 2>/dev/null | head -n 20 || true
+            exit 1
+          fi
+
+          APK_DIR=$(dirname "$APK")
+          echo "✅ APK ditemukan: $APK"
+          echo "📁 Folder: $APK_DIR"
+          echo "APK_DIR=$APK_DIR" >> "$GITHUB_ENV"
+
+      # =========================================================
+      # 9. UPLOAD
+      # =========================================================
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
