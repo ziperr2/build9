@@ -1,4 +1,5 @@
-name: Build Flutter APK (Fallback Worker)
+name: Build APK (Flutter / Gradle Auto)
+
 on:
   workflow_dispatch:
     inputs:
@@ -11,73 +12,198 @@ on:
       payload:
         description: 'Build Payload (JSON)'
         required: true
+      build_type:
+        description: 'release / debug'
+        required: false
+        default: 'release'
+
+concurrency:
+  group: build-${{ github.event.inputs.jobId }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      GRADLE_OPTS: >-
+        -Dorg.gradle.daemon=false
+        -Dorg.gradle.parallel=true
+        -Dorg.gradle.caching=true
+        -Dorg.gradle.configureondemand=true
+        -Dorg.gradle.workers.max=4
+        -Dorg.gradle.jvmargs=-Xmx3g
+
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-      - name: Setup Java
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'zulu'
-          java-version: '17'
-      - name: Setup Flutter
-        uses: subosito/flutter-action@v2
-        with:
-          flutter-version: '3.38.0'
-          channel: 'stable'
-      - name: Prepare Project
+      - name: Parse payload
+        run: |
+          set -euo pipefail
+          echo '${{ github.event.inputs.payload }}' > payload.json
+          cat payload.json
+          ZIP_URL=$(jq -r '.zipAssetUrl // .url // empty' payload.json)
+          if [ -z "$ZIP_URL" ]; then
+            echo "::error::Tidak ada zipAssetUrl / url di payload"
+            exit 1
+          fi
+          echo "ZIP_URL=$ZIP_URL" >> "$GITHUB_ENV"
+
+      - name: Download & extract ZIP
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -e
-          echo '${{ github.event.inputs.payload }}' > payload.json
-          cat payload.json
-          ASSET_URL=$(jq -r '.zipAssetUrl // .url // empty' payload.json)
-          if [ -z "$ASSET_URL" ]; then
-            echo "::error::Tidak ada zipAssetUrl atau url di payload. Isi payload:"
-            cat payload.json
-            exit 1
-          fi
-          echo "Downloading project source from: $ASSET_URL"
-          rm -rf project project.zip
-          mkdir -p project
-          if [[ "$ASSET_URL" == *"api.github.com"* ]]; then
-            curl -fL -H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/octet-stream" -o project.zip "$ASSET_URL"
+          set -euo pipefail
+          rm -rf project_raw project.zip
+          mkdir -p project_raw
+          if [[ "$ZIP_URL" == *"api.github.com"* ]]; then
+            curl -fL --retry 3 --retry-delay 5 \
+              -H "Authorization: Bearer ${GH_TOKEN}" \
+              -H "Accept: application/octet-stream" \
+              -o project.zip "$ZIP_URL"
           else
-            curl -fL -o project.zip "$ASSET_URL"
+            curl -fL --retry 3 --retry-delay 5 -o project.zip "$ZIP_URL"
           fi
-          unzip -q project.zip -d project
-          PUBSPEC=$(find project -maxdepth 5 -type f -name pubspec.yaml | head -n 1)
-          if [ -z "$PUBSPEC" ]; then
-            echo "::error::pubspec.yaml tidak ditemukan di dalam ZIP. Pastikan ini project Flutter yang valid."
-            find project -maxdepth 3
+          ls -lh project.zip
+          unzip -t project.zip >/dev/null
+          unzip -q project.zip -d project_raw
+
+      - name: Detect project type
+        id: detect
+        run: |
+          set -euo pipefail
+          PUBSPEC=$(find project_raw -maxdepth 6 -type f -name pubspec.yaml \
+                    -not -path "*/build/*" -not -path "*/.dart_tool/*" | head -n 1)
+          GRADLEW=$(find project_raw -maxdepth 6 -type f -name gradlew \
+                    -not -path "*/build/*" | head -n 1)
+          SETTINGS=$(find project_raw -maxdepth 6 -type f \
+                    \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
+                    -not -path "*/build/*" | head -n 1)
+          echo "pubspec : ${PUBSPEC:-<none>}"
+          echo "gradlew : ${GRADLEW:-<none>}"
+          echo "settings: ${SETTINGS:-<none>}"
+          if [ -n "$PUBSPEC" ]; then
+            DIR=$(dirname "$PUBSPEC")
+            echo "type=flutter" >> "$GITHUB_OUTPUT"
+            echo "dir=$DIR"     >> "$GITHUB_OUTPUT"
+            echo "✅ Flutter project → $DIR"
+          elif [ -n "$GRADLEW" ] && [ -n "$SETTINGS" ]; then
+            DIR=$(dirname "$GRADLEW")
+            echo "type=gradle"  >> "$GITHUB_OUTPUT"
+            echo "dir=$DIR"     >> "$GITHUB_OUTPUT"
+            echo "✅ Native Gradle project → $DIR"
+          else
+            echo "::error::Project tidak dikenali (bukan Flutter / bukan Gradle)."
+            find project_raw -maxdepth 3
             exit 1
           fi
-          PROJECT_ROOT=$(dirname "$PUBSPEC")
-          echo "PROJECT_ROOT=$PROJECT_ROOT" >> "$GITHUB_ENV"
-          echo "Detected Flutter project root: $PROJECT_ROOT"
-      - name: Build APK
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Flutter
+        if: steps.detect.outputs.type == 'flutter'
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.38.0'
+          channel: stable
+          cache: true
+
+      - name: Cache pub packages
+        if: steps.detect.outputs.type == 'flutter'
+        uses: actions/cache@v4
+        with:
+          path: ~/.pub-cache
+          key: pub-${{ runner.os }}-${{ hashFiles('project_raw/**/pubspec.lock') }}
+          restore-keys: pub-${{ runner.os }}-
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('project_raw/**/*.gradle*', 'project_raw/**/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: Tune gradle.properties
         run: |
-          set -e
-          cd "$PROJECT_ROOT"
-          flutter clean
+          set -euo pipefail
+          if [ "${{ steps.detect.outputs.type }}" = "flutter" ]; then
+            GP="${{ steps.detect.outputs.dir }}/android/gradle.properties"
+          else
+            GP="${{ steps.detect.outputs.dir }}/gradle.properties"
+          fi
+          mkdir -p "$(dirname "$GP")"
+          touch "$GP"
+          sed -i '/org.gradle.jvmargs/d;/org.gradle.parallel/d;/org.gradle.caching/d;/org.gradle.daemon/d;/org.gradle.configureondemand/d' "$GP" || true
+          {
+            echo ""
+            echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g"
+            echo "org.gradle.parallel=true"
+            echo "org.gradle.caching=true"
+            echo "org.gradle.daemon=false"
+            echo "org.gradle.configureondemand=true"
+          } >> "$GP"
+
+      - name: Build Flutter APK
+        if: steps.detect.outputs.type == 'flutter'
+        working-directory: ${{ steps.detect.outputs.dir }}
+        run: |
+          set -euo pipefail
+          flutter config --no-analytics >/dev/null 2>&1 || true
           flutter pub get
-          flutter build apk --release
+          BT="${{ github.event.inputs.build_type }}"
+          [ -z "$BT" ] && BT=release
+          flutter build apk --$BT \
+            --target-platform=android-arm64 \
+            --no-tree-shake-icons \
+            --no-pub
+
+      - name: Build Native APK
+        if: steps.detect.outputs.type == 'gradle'
+        working-directory: ${{ steps.detect.outputs.dir }}
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          BT="${{ github.event.inputs.build_type }}"
+          [ -z "$BT" ] && BT=release
+          if [ "$BT" = "debug" ]; then TASK=":app:assembleDebug"; else TASK=":app:assembleRelease"; fi
+          ./gradlew "$TASK" \
+            --parallel --build-cache \
+            -Pandroid.injected.build.abi=arm64-v8a
+
       - name: Locate APK
         run: |
-          set -e
-          APK_PATH=$(find "$PROJECT_ROOT" -type f -name "app-release.apk" | head -n 1)
-          if [ -z "$APK_PATH" ]; then
-            echo "::error::app-release.apk tidak ditemukan setelah build."
-            find "$PROJECT_ROOT/build" -maxdepth 5 2>/dev/null || true
-            exit 1
+          set -euo pipefail
+          DIR="${{ steps.detect.outputs.dir }}"
+          APK_DIR=""
+          if [ -d "$DIR/build/app/outputs/flutter-apk" ]; then
+            APK_DIR="$DIR/build/app/outputs/flutter-apk"
+          elif [ -d "$DIR/app/build/outputs/apk" ]; then
+            APK_DIR=$(find "$DIR/app/build/outputs/apk" -type d \
+                      \( -name "release" -o -name "debug" \) | head -n 1)
+            [ -z "$APK_DIR" ] && APK_DIR="$DIR/app/build/outputs/apk"
           fi
-          echo "APK_PATH=$APK_PATH" >> "$GITHUB_ENV"
-          echo "Found APK at: $APK_PATH"
-      - name: Upload Artifact
+          if [ -z "$APK_DIR" ] || [ -z "$(find "$APK_DIR" -maxdepth 2 -name '*.apk' 2>/dev/null)" ]; then
+            APK=$(find "$DIR" -type f -name "*.apk" \
+                  -not -path "*/intermediates/*" | head -n 1)
+            if [ -z "$APK" ]; then
+              echo "::error::APK tidak ditemukan setelah build."
+              exit 1
+            fi
+            APK_DIR=$(dirname "$APK")
+          fi
+          echo "APK_DIR=$APK_DIR" >> "$GITHUB_ENV"
+          echo "=== APK yang dihasilkan ==="
+          ls -lh "$APK_DIR"/*.apk
+
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: apk-${{ github.event.inputs.jobId }}
-          path: ${{ env.APK_PATH }}
+          path: ${{ env.APK_DIR }}/*.apk
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
